@@ -1,45 +1,29 @@
-FROM python:3.14
+# syntax=docker/dockerfile:1
+# Tudovu-generated. Multi-stage, non-root runtime, with a HEALTHCHECK.
+FROM node:22-alpine AS build
+WORKDIR /app
+COPY package*.json ./
+RUN if [ -f package-lock.json ]; then npm ci; else npm install; fi
+COPY . .
+RUN npm run build --if-present
 
-ENV PYTHONUNBUFFERED=1
-
-# Install uv
-# Ref: https://docs.astral.sh/uv/guides/integration/docker/#installing-uv
-COPY --from=ghcr.io/astral-sh/uv:0.9.26 /uv /uvx /bin/
-
-# Compile bytecode
-# Ref: https://docs.astral.sh/uv/guides/integration/docker/#compiling-bytecode
-ENV UV_COMPILE_BYTECODE=1
-
-# uv Cache
-# Ref: https://docs.astral.sh/uv/guides/integration/docker/#caching
-ENV UV_LINK_MODE=copy
-
-WORKDIR /app/
-
-# Place executables in the environment at the front of the path
-# Ref: https://docs.astral.sh/uv/guides/integration/docker/#using-the-environment
-ENV PATH="/app/.venv/bin:$PATH"
-
-# Install dependencies
-# Ref: https://docs.astral.sh/uv/guides/integration/docker/#intermediate-layers
-RUN --mount=type=cache,target=/root/.cache/uv \
-    --mount=type=bind,source=uv.lock,target=uv.lock \
-    --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
-    uv sync --frozen --no-install-workspace --package app
-
-COPY ./backend/scripts /app/backend/scripts
-
-COPY ./backend/pyproject.toml ./backend/alembic.ini /app/backend/
-
-COPY ./backend/app /app/backend/app
-
-# Sync the project
-# Ref: https://docs.astral.sh/uv/guides/integration/docker/#intermediate-layers
-RUN --mount=type=cache,target=/root/.cache/uv \
-    --mount=type=bind,source=uv.lock,target=uv.lock \
-    --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
-    uv sync --frozen --package app
-
-WORKDIR /app/backend/
-
-CMD ["fastapi", "run", "--workers", "4"]
+FROM node:22-alpine AS runtime
+WORKDIR /app
+ENV NODE_ENV=production PORT=3000
+# Copy the built app, then prune to production dependencies IN PLACE.
+#
+# Order matters and used to be wrong: this stage installed with --omit=dev and the
+# very next line copied /app from the build stage, which overwrote that with the
+# build stage's full node_modules -- devDependencies included. The result was the opposite
+# of the intent: jest and its transitive deps shipped to production, and the Trivy
+# image gate then blocked on CVEs in packages that never run (observed live:
+# app/node_modules/test-exclude/... flagged, a jest dependency).
+COPY --from=build /app ./
+RUN npm prune --omit=dev && npm cache clean --force
+# Run as a non-root user.
+RUN addgroup -S app && adduser -S app -G app && chown -R app:app /app
+USER app
+EXPOSE 3000
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
+  CMD wget -q -O- "http://127.0.0.1:3000/healthz" || exit 1
+CMD ["node","server.js"]
