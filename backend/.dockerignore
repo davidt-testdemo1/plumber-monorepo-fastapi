@@ -1,8 +1,16 @@
-# Python
+node_modules
+npm-debug.log*
 __pycache__
-app.egg-info
 *.pyc
-.mypy_cache
-.coverage
-htmlcov
 .venv
+venv
+vendor
+.git
+.github
+.env
+.env.*
+.DS_Store
+dist
+build
+coverage
+*.md
