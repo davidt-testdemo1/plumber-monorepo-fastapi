@@ -1,0 +1,283 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Container service (Tudovu). ECS Fargate behind an internet-facing
+  Application Load Balancer (HTTP). Image from ECR. No custom domain — served on
+  the ALB DNS name. Add a domain via the Website path for HTTPS + Route53.
+
+# ── Variables your app reads that Tudovu could not supply ──────────────────────
+# POSTGRES_SERVER, FIRST_SUPERUSER, FIRST_SUPERUSER_PASSWORD, SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, EMAILS_FROM_EMAIL, EMAILS_FROM_NAME, BACKEND_CORS_ORIGINS, SENTRY_DSN, VITE_API_URL, DOMAIN
+#
+# These are intentionally NOT set on the container. Setting them to an empty string
+# would be worse than leaving them alone: code like os.environ.setdefault(...) or
+# process.env.X ?? default treats an empty value as "already configured" and skips
+# its own default.
+#
+# Plain values: set the matching Env* parameter below.
+# Credentials and connection strings: create a Secrets Manager secret and add it to
+# the task definition's Secrets list — Tudovu will not invent a value, because a
+# random string cannot authenticate to a third party or parse as a connection URL.
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC to run the service + load balancer in.
+  PublicSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Two or more public subnets for the ALB and Fargate tasks.
+  ImageUri:
+    Type: String
+    Description: ECR image URI the CI/CD workflow pushes.
+  DesiredCount:
+    Type: Number
+    Default: 2
+  EnvPostgresServer:
+    Type: String
+    Default: ""
+    Description: Optional POSTGRES_SERVER for the app container. Injected only when non-empty.
+  EnvFirstSuperuser:
+    Type: String
+    Default: ""
+    Description: Optional FIRST_SUPERUSER for the app container. Injected only when non-empty.
+  EnvSmtpHost:
+    Type: String
+    Default: ""
+    Description: Optional SMTP_HOST for the app container. Injected only when non-empty.
+  EnvSmtpPort:
+    Type: String
+    Default: ""
+    Description: Optional SMTP_PORT for the app container. Injected only when non-empty.
+  EnvSmtpUser:
+    Type: String
+    Default: ""
+    Description: Optional SMTP_USER for the app container. Injected only when non-empty.
+  EnvEmailsFromEmail:
+    Type: String
+    Default: ""
+    Description: Optional EMAILS_FROM_EMAIL for the app container. Injected only when non-empty.
+  EnvEmailsFromName:
+    Type: String
+    Default: ""
+    Description: Optional EMAILS_FROM_NAME for the app container. Injected only when non-empty.
+  EnvBackendCorsOrigins:
+    Type: String
+    Default: ""
+    Description: Optional BACKEND_CORS_ORIGINS for the app container. Injected only when non-empty.
+  EnvViteApiUrl:
+    Type: String
+    Default: ""
+    Description: Optional VITE_API_URL for the app container. Injected only when non-empty.
+  EnvDomain:
+    Type: String
+    Default: ""
+    Description: Optional DOMAIN for the app container. Injected only when non-empty.
+
+Conditions:
+  HasEnvPostgresServer: !Not [!Equals [!Ref EnvPostgresServer, ""]]
+  HasEnvFirstSuperuser: !Not [!Equals [!Ref EnvFirstSuperuser, ""]]
+  HasEnvSmtpHost: !Not [!Equals [!Ref EnvSmtpHost, ""]]
+  HasEnvSmtpPort: !Not [!Equals [!Ref EnvSmtpPort, ""]]
+  HasEnvSmtpUser: !Not [!Equals [!Ref EnvSmtpUser, ""]]
+  HasEnvEmailsFromEmail: !Not [!Equals [!Ref EnvEmailsFromEmail, ""]]
+  HasEnvEmailsFromName: !Not [!Equals [!Ref EnvEmailsFromName, ""]]
+  HasEnvBackendCorsOrigins: !Not [!Equals [!Ref EnvBackendCorsOrigins, ""]]
+  HasEnvViteApiUrl: !Not [!Equals [!Ref EnvViteApiUrl, ""]]
+  HasEnvDomain: !Not [!Equals [!Ref EnvDomain, ""]]
+
+Resources:
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB ingress (HTTP 80) from the internet.
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+  ServiceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Tasks accept traffic only from the ALB.
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: application
+      Scheme: internet-facing
+      Subnets: !Ref PublicSubnetIds
+      SecurityGroups:
+        - !Ref AlbSecurityGroup
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref VpcId
+      Port: 3000
+      Protocol: HTTP
+      TargetType: ip
+      HealthCheckPath: /
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 5
+      Matcher:
+        HttpCode: 200-399
+
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${AWS::StackName}"
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/tudovu/${AWS::StackName}"
+      RetentionInDays: 30
+
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      PermissionsBoundary: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/TudovuArchitectBoundary'
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+      Policies:
+        - PolicyName: read-secrets
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref SecretSecretKey
+
+  SecretSecretKey:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: !Sub "SECRET_KEY for ${AWS::StackName}"
+      GenerateSecretString:
+        PasswordLength: 50
+        ExcludePunctuation: true
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: "512"
+      Memory: "1024"
+      ExecutionRoleArn: !Ref TaskExecutionRole
+      ContainerDefinitions:
+        - Name: app
+          Image: !Ref ImageUri
+          PortMappings:
+            - ContainerPort: 3000
+          Essential: true
+          Environment:
+            - !If
+              - HasEnvPostgresServer
+              - Name: POSTGRES_SERVER
+                Value: !Ref EnvPostgresServer
+              - !Ref "AWS::NoValue"
+            - !If
+              - HasEnvFirstSuperuser
+              - Name: FIRST_SUPERUSER
+                Value: !Ref EnvFirstSuperuser
+              - !Ref "AWS::NoValue"
+            - !If
+              - HasEnvSmtpHost
+              - Name: SMTP_HOST
+                Value: !Ref EnvSmtpHost
+              - !Ref "AWS::NoValue"
+            - !If
+              - HasEnvSmtpPort
+              - Name: SMTP_PORT
+                Value: !Ref EnvSmtpPort
+              - !Ref "AWS::NoValue"
+            - !If
+              - HasEnvSmtpUser
+              - Name: SMTP_USER
+                Value: !Ref EnvSmtpUser
+              - !Ref "AWS::NoValue"
+            - !If
+              - HasEnvEmailsFromEmail
+              - Name: EMAILS_FROM_EMAIL
+                Value: !Ref EnvEmailsFromEmail
+              - !Ref "AWS::NoValue"
+            - !If
+              - HasEnvEmailsFromName
+              - Name: EMAILS_FROM_NAME
+                Value: !Ref EnvEmailsFromName
+              - !Ref "AWS::NoValue"
+            - !If
+              - HasEnvBackendCorsOrigins
+              - Name: BACKEND_CORS_ORIGINS
+                Value: !Ref EnvBackendCorsOrigins
+              - !Ref "AWS::NoValue"
+            - !If
+              - HasEnvViteApiUrl
+              - Name: VITE_API_URL
+                Value: !Ref EnvViteApiUrl
+              - !Ref "AWS::NoValue"
+            - !If
+              - HasEnvDomain
+              - Name: DOMAIN
+                Value: !Ref EnvDomain
+              - !Ref "AWS::NoValue"
+          Secrets:
+            - Name: SECRET_KEY
+              ValueFrom: !Ref SecretSecretKey
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref "AWS::Region"
+              awslogs-stream-prefix: app
+
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn: HttpListener
+    Properties:
+      Cluster: !Ref Cluster
+      LaunchType: FARGATE
+      DesiredCount: !Ref DesiredCount
+      TaskDefinition: !Ref TaskDefinition
+      HealthCheckGracePeriodSeconds: 60
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: !Ref PublicSubnetIds
+          SecurityGroups:
+            - !Ref ServiceSecurityGroup
+      LoadBalancers:
+        - ContainerName: app
+          ContainerPort: 3000
+          TargetGroupArn: !Ref TargetGroup
+
+Outputs:
+  AppUrl:
+    Description: App URL (ALB DNS). Add a custom domain via the Website path for HTTPS.
+    Value: !Sub "http://${LoadBalancer.DNSName}"
